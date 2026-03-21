@@ -1,0 +1,854 @@
+// ============================================================================
+// NSIGII DOP Adapter - UI/UX ZIP Interface
+// main.go
+//
+// Data-Oriented Programming Adapter that:
+//   1. Accepts a .zip containing UI/UX component structure
+//   2. Extracts and parses component specs (adapter/, components/, render/, syntax/)
+//   3. Applies DOP transformation: Functional  OOP rendering modes
+//   4. Validates component props (ComponentValidator - domain_sepcific.tsx port)
+//   5. Serves the assembled UI via HTTP with NSIGII Trident verification headers
+//
+// Linkable-Then-Executable pattern:
+//   LINK   extract zip, register components
+//   THEN   apply DOP adapter (functional or OOP mode)
+//   EXEC   serve HTTP or render to stdout
+//
+// Pipeline: riftlang.exe  .so.a  rift.exe  gosilang  this binary
+// Orchestration: nlink  polybuild
+//
+// Usage:
+//   go run main.go --zip ./dop-adapter-main.zip [--port 8080] [--mode functional|oop|both]
+//   go run main.go --zip ./dop-adapter-main.zip --render-only
+// ============================================================================
+
+package main
+
+import (
+	"archive/zip"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ============================================================================
+// VERSION AND CONSTANTS
+// ============================================================================
+
+const (
+	VERSION          = "0.1.0"
+	TRIDENT_VERSION  = "7.0.0"
+	CONSENSUS_THRESHOLD = 0.67 // 2/3 bipartite majority
+	DECAY_CONSTANT   = 0.36787944117144233 // 1/e
+
+	// DOP render modes (mirrors renderFunc.js / renderOOP.js)
+	MODE_FUNCTIONAL = "functional"
+	MODE_OOP        = "oop"
+	MODE_BOTH       = "both"
+
+	// Component file roles (maps to dop-adapter-main directory structure)
+	ROLE_ADAPTER    = "adapter"
+	ROLE_COMPONENT  = "components"
+	ROLE_RENDER     = "render"
+	ROLE_SYNTAX     = "syntax"
+)
+
+// ============================================================================
+// DATA STRUCTURES - DOP CORE
+// (Go equivalent of ButtonLogic.js, DOPAdapter.js, domain_sepcific.tsx)
+// ============================================================================
+
+// ComponentState mirrors the `state` field in ButtonLogic.js
+type ComponentState map[string]interface{}
+
+// ComponentAction is a pure function: (state, args)  (newState, output)
+// Mirrors the `actions` map in ButtonLogic.js
+type ComponentAction func(state ComponentState, args ...interface{}) (ComponentState, string)
+
+// ValidationConstraint mirrors ValidationConstraint in domain_sepcific.tsx
+type ValidationConstraint struct {
+	Type         string
+	Required     bool
+	ErrorMessage string
+	Validate     func(value interface{}, state ComponentState) bool
+}
+
+// ComponentSpec is the data-oriented component definition.
+// Mirrors: { name, state, actions, render } in ButtonLogic.js
+type ComponentSpec struct {
+	Name        string
+	Role        string            // adapter | components | render | syntax
+	SourceFile  string            // original filename from zip
+	State       ComponentState
+	Actions     map[string]ComponentAction
+	Constraints map[string]ValidationConstraint // ComponentValidator fields
+	RenderFn    func(state ComponentState) string
+	RawSource   string            // Original JS/TS source (for display)
+}
+
+// DOPAdapter mirrors DOPAdapter.js - bridges functional and OOP paradigms.
+// In Go there are no true classes, so OOP mode uses a struct + method set.
+type DOPAdapter struct {
+	spec  *ComponentSpec
+	state ComponentState
+	mu    sync.RWMutex
+}
+
+// FunctionalInstance mirrors toFunctional() - stateless snapshot render
+type FunctionalInstance struct {
+	State   ComponentState
+	Render  func() string
+	Actions map[string]func(args ...interface{}) string
+}
+
+// OOPInstance mirrors toOOP() - encapsulated state with methods
+type OOPInstance struct {
+	adapter *DOPAdapter
+}
+
+func (o *OOPInstance) Toggle() {
+	o.adapter.mu.Lock()
+	defer o.adapter.mu.Unlock()
+	if action, ok := o.adapter.spec.Actions["toggle"]; ok {
+		newState, _ := action(o.adapter.state)
+		o.adapter.state = newState
+	}
+}
+
+func (o *OOPInstance) Reset() {
+	o.adapter.mu.Lock()
+	defer o.adapter.mu.Unlock()
+	if action, ok := o.adapter.spec.Actions["reset"]; ok {
+		newState, _ := action(o.adapter.state)
+		o.adapter.state = newState
+	}
+}
+
+func (o *OOPInstance) Render() string {
+	o.adapter.mu.RLock()
+	defer o.adapter.mu.RUnlock()
+	if o.adapter.spec.RenderFn != nil {
+		return o.adapter.spec.RenderFn(o.adapter.state)
+	}
+	return fmt.Sprintf("<div>%s</div>", o.adapter.spec.Name)
+}
+
+func (o *OOPInstance) GetState() ComponentState {
+	o.adapter.mu.RLock()
+	defer o.adapter.mu.RUnlock()
+	copy := make(ComponentState)
+	for k, v := range o.adapter.state {
+		copy[k] = v
+	}
+	return copy
+}
+
+// ============================================================================
+// DOP ADAPTER CONSTRUCTOR
+// ============================================================================
+
+// NewDOPAdapter mirrors: new DOPAdapter(logic) in DOPAdapter.js
+func NewDOPAdapter(spec *ComponentSpec) *DOPAdapter {
+	initialState := make(ComponentState)
+	for k, v := range spec.State {
+		initialState[k] = v
+	}
+	return &DOPAdapter{
+		spec:  spec,
+		state: initialState,
+	}
+}
+
+// ToFunctional mirrors: adapter.toFunctional() - returns a stateless snapshot
+func (a *DOPAdapter) ToFunctional() *FunctionalInstance {
+	a.mu.RLock()
+	snapshot := make(ComponentState)
+	for k, v := range a.state {
+		snapshot[k] = v
+	}
+	a.mu.RUnlock()
+
+	spec := a.spec
+	inst := &FunctionalInstance{
+		State: snapshot,
+		Render: func() string {
+			if spec.RenderFn != nil {
+				return spec.RenderFn(snapshot)
+			}
+			return fmt.Sprintf("<div>%s</div>", spec.Name)
+		},
+		Actions: make(map[string]func(args ...interface{}) string),
+	}
+
+	for name, action := range spec.Actions {
+		actionName := name
+		actionFn := action
+		inst.Actions[actionName] = func(args ...interface{}) string {
+			newState, out := actionFn(snapshot, args...)
+			snapshot = newState
+			return out
+		}
+	}
+
+	return inst
+}
+
+// ToOOP mirrors: adapter.toOOP() - returns an instance with encapsulated state
+func (a *DOPAdapter) ToOOP() *OOPInstance {
+	return &OOPInstance{adapter: a}
+}
+
+// ============================================================================
+// COMPONENT VALIDATOR
+// Mirrors ComponentValidator class from domain_sepcific.tsx
+// ============================================================================
+
+type ValidationError struct {
+	Code    string
+	Message string
+	Source  string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("[%s] %s (from %s)", e.Code, e.Message, e.Source)
+}
+
+func ValidateComponent(spec *ComponentSpec, props ComponentState) error {
+	for propName, constraint := range spec.Constraints {
+		value, exists := props[propName]
+
+		if constraint.Required && (!exists || value == nil) {
+			return &ValidationError{
+				Code:    "MISSING_REQUIRED_PROP",
+				Message: fmt.Sprintf("Required prop '%s' is missing", propName),
+				Source:  "ComponentValidator",
+			}
+		}
+
+		if !exists {
+			continue
+		}
+
+		if constraint.Validate != nil && !constraint.Validate(value, props) {
+			return &ValidationError{
+				Code:    "VALIDATION_FAILED",
+				Message: fmt.Sprintf("Validation failed for '%s': %s", propName, constraint.ErrorMessage),
+				Source:  "ComponentValidator",
+			}
+		}
+	}
+	return nil
+}
+
+// ============================================================================
+// ZIP LOADER
+// "Linkable-Then-Executable": LINK phase = extract zip and register components
+// ============================================================================
+
+// UIPackage holds all components extracted from the zip
+type UIPackage struct {
+	Name       string
+	Components map[string]*ComponentSpec // keyed by role/filename
+	Assets     map[string][]byte         // raw bytes of non-JS files (HTML, CSS, etc.)
+	Adapters   []*DOPAdapter
+	LoadedAt   time.Time
+}
+
+// LoadZip is the LINK phase: extract zip  parse  register components
+func LoadZip(zipPath string) (*UIPackage, error) {
+	pkg := &UIPackage{
+		Name:       filepath.Base(zipPath),
+		Components: make(map[string]*ComponentSpec),
+		Assets:     make(map[string][]byte),
+		LoadedAt:   time.Now(),
+	}
+
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open zip %s: %w", zipPath, err)
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			log.Printf("[WARN] Could not open zip entry %s: %v", f.Name, err)
+			continue
+		}
+
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			log.Printf("[WARN] Could not read zip entry %s: %v", f.Name, err)
+			continue
+		}
+
+		name := filepath.ToSlash(f.Name)
+		ext  := strings.ToLower(filepath.Ext(name))
+
+		switch ext {
+		case ".js", ".mjs", ".ts", ".tsx":
+			spec := parseComponentSpec(name, string(data))
+			pkg.Components[name] = spec
+			log.Printf("[LINK] Registered component: %s (role=%s)", name, spec.Role)
+		default:
+			pkg.Assets[name] = data
+			log.Printf("[LINK] Asset registered: %s (%d bytes)", name, len(data))
+		}
+	}
+
+	// THEN phase: wire adapters for every component-role spec
+	for _, spec := range pkg.Components {
+		if spec.Role == ROLE_COMPONENT || spec.Role == ROLE_ADAPTER {
+			adapter := NewDOPAdapter(spec)
+			pkg.Adapters = append(pkg.Adapters, adapter)
+			log.Printf("[THEN] DOP Adapter wired for: %s", spec.Name)
+		}
+	}
+
+	return pkg, nil
+}
+
+// parseComponentSpec infers a ComponentSpec from file path and source content.
+// This is a semantic parser - it reads the role from the directory path and
+// synthesises a Go ComponentSpec with appropriate defaults.
+//
+// For a full implementation, replace this with a proper JS/TS parser.
+// For now it provides the correct structure for serving the UI.
+func parseComponentSpec(filePath, source string) *ComponentSpec {
+	parts := strings.SplitN(filepath.ToSlash(filePath), "/", -1)
+	role  := ROLE_COMPONENT
+	if len(parts) >= 2 {
+		role = parts[len(parts)-2]
+	}
+
+	name := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+
+	spec := &ComponentSpec{
+		Name:        name,
+		Role:        role,
+		SourceFile:  filePath,
+		State:       ComponentState{"clicked": false, "count": 0},
+		Actions:     make(map[string]ComponentAction),
+		Constraints: make(map[string]ValidationConstraint),
+		RawSource:   source,
+	}
+
+	// Wire built-in ButtonLogic-style actions for button components
+	if strings.Contains(strings.ToLower(name), "button") ||
+		strings.Contains(strings.ToLower(source), "toggle") {
+
+		spec.Actions["toggle"] = func(state ComponentState, args ...interface{}) (ComponentState, string) {
+			newState := make(ComponentState)
+			for k, v := range state {
+				newState[k] = v
+			}
+			if clicked, ok := newState["clicked"].(bool); ok {
+				newState["clicked"] = !clicked
+			}
+			if count, ok := newState["count"].(int); ok {
+				newState["count"] = count + 1
+			}
+			return newState, ""
+		}
+
+		spec.Actions["reset"] = func(state ComponentState, args ...interface{}) (ComponentState, string) {
+			return ComponentState{"clicked": false, "count": 0}, ""
+		}
+
+		spec.RenderFn = func(state ComponentState) string {
+			label := "OFF"
+			cls   := "off"
+			if clicked, ok := state["clicked"].(bool); ok && clicked {
+				label = "ON"
+				cls   = "on"
+			}
+			count := 0
+			if c, ok := state["count"].(int); ok {
+				count = c
+			}
+			return fmt.Sprintf(`<button class="%s" data-count="%d">%s</button>`, cls, count, label)
+		}
+
+		// ComponentValidator constraints (domain_sepcific.tsx pattern)
+		spec.Constraints["clicked"] = ValidationConstraint{
+			Type:         "bool",
+			Required:     false,
+			ErrorMessage: "clicked must be a boolean",
+			Validate: func(v interface{}, s ComponentState) bool {
+				_, ok := v.(bool)
+				return ok
+			},
+		}
+	}
+
+	// Generic render fallback for non-button components
+	if spec.RenderFn == nil {
+		specName := spec.Name
+		spec.RenderFn = func(state ComponentState) string {
+			stateJSON, _ := json.Marshal(state)
+			return fmt.Sprintf(`<div class="component" data-name="%s"><pre>%s</pre></div>`,
+				specName, string(stateJSON))
+		}
+	}
+
+	return spec
+}
+
+// ============================================================================
+// HTTP SERVER - EXECUTE PHASE
+// Serves the DOP-adapted UI with NSIGII trident verification headers
+// ============================================================================
+
+// NSIGIIHeaders adds constitutional verification headers to every response
+func NSIGIIHeaders(w http.ResponseWriter, pkg *UIPackage) {
+	w.Header().Set("X-NSIGII-Version", TRIDENT_VERSION)
+	w.Header().Set("X-NSIGII-DOP-Version", VERSION)
+	w.Header().Set("X-NSIGII-Package", pkg.Name)
+	w.Header().Set("X-NSIGII-Loaded-At", pkg.LoadedAt.Format(time.RFC3339))
+	w.Header().Set("X-NSIGII-Components", fmt.Sprintf("%d", len(pkg.Components)))
+	w.Header().Set("X-NSIGII-Adapters", fmt.Sprintf("%d", len(pkg.Adapters)))
+	w.Header().Set("X-NSIGII-Rights",
+		"Receiver-Ownership=IRREVOCABLE; Sender-Retrieval=REVOKED; "+
+			"Ledger-Witnessing=ACTIVE; Controller-EZE=ACCOUNTABLE")
+}
+
+// handleIndex serves the main dashboard
+func handleIndex(pkg *UIPackage, mode string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		NSIGIIHeaders(w, pkg)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+		type ComponentView struct {
+			Name       string
+			Role       string
+			SourceFile string
+			Functional string
+			OOP        string
+			State      string
+		}
+
+		var views []ComponentView
+		for _, adapter := range pkg.Adapters {
+			funcInst := adapter.ToFunctional()
+			oopInst  := adapter.ToOOP()
+
+			stateJSON, _ := json.MarshalIndent(adapter.state, "", "  ")
+
+			cv := ComponentView{
+				Name:       adapter.spec.Name,
+				Role:       adapter.spec.Role,
+				SourceFile: adapter.spec.SourceFile,
+				OOP:        oopInst.Render(),
+				State:      string(stateJSON),
+			}
+
+			if mode == MODE_FUNCTIONAL || mode == MODE_BOTH {
+				cv.Functional = funcInst.Render()
+			}
+			if mode == MODE_OOP || mode == MODE_BOTH {
+				cv.OOP = oopInst.Render()
+			}
+
+			views = append(views, cv)
+		}
+
+		// Source listing
+		type SourceFile struct {
+			Path   string
+			Role   string
+			Lines  int
+			Source string
+		}
+		var sources []SourceFile
+		for path, spec := range pkg.Components {
+			lines := len(strings.Split(spec.RawSource, "\n"))
+			src   := spec.RawSource
+			if len(src) > 800 {
+				src = src[:800] + "\n. [truncated]"
+			}
+			sources = append(sources, SourceFile{
+				Path:   path,
+				Role:   spec.Role,
+				Lines:  lines,
+				Source: src,
+			})
+		}
+
+		data := struct {
+			PackageName string
+			Version     string
+			Mode        string
+			LoadedAt    string
+			Components  []ComponentView
+			Sources     []SourceFile
+			NumAssets   int
+		}{
+			PackageName: pkg.Name,
+			Version:     VERSION,
+			Mode:        mode,
+			LoadedAt:    pkg.LoadedAt.Format(time.RFC1123),
+			Components:  views,
+			Sources:     sources,
+			NumAssets:   len(pkg.Assets),
+		}
+
+		if err := indexTemplate.Execute(w, data); err != nil {
+			http.Error(w, err.Error(), 500)
+		}
+	}
+}
+
+// handleToggle handles POST /toggle?component=<name>
+func handleToggle(pkg *UIPackage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		NSIGIIHeaders(w, pkg)
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		compName := r.URL.Query().Get("component")
+		for _, adapter := range pkg.Adapters {
+			if adapter.spec.Name == compName || compName == "" {
+				oop := adapter.ToOOP()
+				oop.Toggle()
+				state := oop.GetState()
+				rendered := oop.Render()
+
+				resp := map[string]interface{}{
+					"component": adapter.spec.Name,
+					"state":     state,
+					"rendered":  rendered,
+					"timestamp": time.Now().UnixMilli(),
+				}
+				json.NewEncoder(w).Encode(resp)
+				return
+			}
+		}
+		http.Error(w, `{"error":"component not found"}`, 404)
+	}
+}
+
+// handleComponents returns JSON list of all loaded components
+func handleComponents(pkg *UIPackage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		NSIGIIHeaders(w, pkg)
+		w.Header().Set("Content-Type", "application/json")
+
+		type CompInfo struct {
+			Name       string         `json:"name"`
+			Role       string         `json:"role"`
+			SourceFile string         `json:"source_file"`
+			State      ComponentState `json:"state"`
+			Actions    []string       `json:"actions"`
+		}
+
+		var infos []CompInfo
+		for _, adapter := range pkg.Adapters {
+			actions := make([]string, 0, len(adapter.spec.Actions))
+			for k := range adapter.spec.Actions {
+				actions = append(actions, k)
+			}
+			infos = append(infos, CompInfo{
+				Name:       adapter.spec.Name,
+				Role:       adapter.spec.Role,
+				SourceFile: adapter.spec.SourceFile,
+				State:      adapter.state,
+				Actions:    actions,
+			})
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"package":    pkg.Name,
+			"version":    VERSION,
+			"components": infos,
+			"loaded_at":  pkg.LoadedAt,
+		})
+	}
+}
+
+// handleAsset serves raw assets from the zip
+func handleAsset(pkg *UIPackage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		NSIGIIHeaders(w, pkg)
+
+		assetPath := strings.TrimPrefix(r.URL.Path, "/asset/")
+		for name, data := range pkg.Assets {
+			if strings.HasSuffix(filepath.ToSlash(name), assetPath) {
+				ext := strings.ToLower(filepath.Ext(name))
+				switch ext {
+				case ".css":
+					w.Header().Set("Content-Type", "text/css")
+				case ".html":
+					w.Header().Set("Content-Type", "text/html")
+				case ".json":
+					w.Header().Set("Content-Type", "application/json")
+				default:
+					w.Header().Set("Content-Type", "application/octet-stream")
+				}
+				w.Write(data)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}
+}
+
+// ============================================================================
+// RENDER-ONLY MODE (no HTTP server - prints to stdout)
+// ============================================================================
+
+func renderOnly(pkg *UIPackage, mode string) {
+	fmt.Printf("\nษออออออออออออออออออออออออออออออออออออออออออออออออออออออป\n")
+	fmt.Printf("บ  NSIGII DOP Adapter - Render Output                  บ\n")
+	fmt.Printf("บ  Package: %-42sบ\n", pkg.Name)
+	fmt.Printf("บ  Mode:    %-42sบ\n", mode)
+	fmt.Printf("ศออออออออออออออออออออออออออออออออออออออออออออออออออออออผ\n\n")
+
+	for _, adapter := range pkg.Adapters {
+		fmt.Printf("ฤฤ Component: %s (role=%s)\n", adapter.spec.Name, adapter.spec.Role)
+		fmt.Printf("   Source: %s\n", adapter.spec.SourceFile)
+
+		stateJSON, _ := json.MarshalIndent(adapter.state, "   ", "  ")
+		fmt.Printf("   State: %s\n", string(stateJSON))
+
+		if mode == MODE_FUNCTIONAL || mode == MODE_BOTH {
+			fi := adapter.ToFunctional()
+			fmt.Printf("   [Functional Render]: %s\n", fi.Render())
+		}
+		if mode == MODE_OOP || mode == MODE_BOTH {
+			oop := adapter.ToOOP()
+			fmt.Printf("   [OOP Render]:        %s\n", oop.Render())
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Assets in package: %d\n", len(pkg.Assets))
+	fmt.Printf("Components loaded: %d\n", len(pkg.Components))
+	fmt.Printf("Adapters wired:    %d\n", len(pkg.Adapters))
+}
+
+// ============================================================================
+// MAIN - CLI entry point
+// ============================================================================
+
+func main() {
+	zipPath    := flag.String("zip",    "",            "Path to .zip file containing UI/UX components")
+	port       := flag.String("port",   "8080",        "HTTP server port")
+	mode       := flag.String("mode",   MODE_BOTH,     "Render mode: functional | oop | both")
+	renderOnly_ := flag.Bool("render-only", false,    "Print rendered output to stdout, no HTTP server")
+	flag.Parse()
+
+	fmt.Printf("\nษออออออออออออออออออออออออออออออออออออออออออออออออออออออป\n")
+	fmt.Printf("บ  NSIGII DOP Adapter UI Server  v%-20sบ\n", VERSION)
+	fmt.Printf("บ  Trident Protocol  v%-32sบ\n", TRIDENT_VERSION)
+	fmt.Printf("บ  OBINexus Computing - Constitutional Computing       บ\n")
+	fmt.Printf("ศออออออออออออออออออออออออออออออออออออออออออออออออออออออผ\n\n")
+
+	if *zipPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: --zip is required")
+		fmt.Fprintln(os.Stderr, "Usage: go run main.go --zip ./dop-adapter-main.zip [--port 8080] [--mode both]")
+		os.Exit(1)
+	}
+
+	// ฤฤ LINK PHASE ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+	fmt.Printf("[LINK]  Loading zip: %s\n", *zipPath)
+	pkg, err := LoadZip(*zipPath)
+	if err != nil {
+		log.Fatalf("[LINK]  Failed: %v", err)
+	}
+	fmt.Printf("[LINK]  Loaded %d components, %d assets, %d adapters wired\n\n",
+		len(pkg.Components), len(pkg.Assets), len(pkg.Adapters))
+
+	// ฤฤ RENDER-ONLY (no HTTP) ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+	if *renderOnly_ {
+		renderOnly(pkg, *mode)
+		return
+	}
+
+	// ฤฤ EXECUTE PHASE - HTTP Server ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+	mux := http.NewServeMux()
+	mux.HandleFunc("/",           handleIndex(pkg, *mode))
+	mux.HandleFunc("/components", handleComponents(pkg))
+	mux.HandleFunc("/toggle",     handleToggle(pkg))
+	mux.HandleFunc("/asset/",     handleAsset(pkg))
+
+	addr := ":" + *port
+	fmt.Printf("[EXEC]  HTTP server starting on http://localhost%s\n", addr)
+	fmt.Printf("[EXEC]  Routes:\n")
+	fmt.Printf("          GET  /             - DOP UI dashboard (mode=%s)\n", *mode)
+	fmt.Printf("          GET  /components   - JSON component registry\n")
+	fmt.Printf("          POST /toggle?component=<name> - Toggle component state\n")
+	fmt.Printf("          GET  /asset/<path> - Serve raw zip asset\n\n")
+
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	log.Fatal(server.ListenAndServe())
+}
+
+// ============================================================================
+// HTML TEMPLATE - DOP Dashboard
+// ============================================================================
+
+var indexTemplate = template.Must(template.New("index").Funcs(template.FuncMap{
+	"roleColor": func(role string) string {
+		switch role {
+		case "adapter":    return "#4fc3f7"
+		case "components": return "#81c784"
+		case "render":     return "#ffb74d"
+		case "syntax":     return "#ce93d8"
+		default:           return "#90a4ae"
+		}
+	},
+}).Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>NSIGII DOP Adapter UI - {{.PackageName}}</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --orange: #d29922; --purple: #a371f7;
+      --red: #f85149; --on: #3fb950; --off: #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', monospace; }
+    .header { background: var(--surface); border-bottom: 1px solid var(--border);
+              padding: 1.5rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    .header h1 { font-size: 1.4rem; color: var(--accent); }
+    .badge { background: var(--border); padding: 0.2rem 0.6rem; border-radius: 4px;
+             font-size: 0.75rem; color: var(--muted); }
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1.5rem; }
+    .card { background: var(--surface); border: 1px solid var(--border);
+            border-radius: 8px; overflow: hidden; }
+    .card-header { padding: 0.75rem 1rem; display: flex; align-items: center; gap: 0.5rem;
+                   border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+    .card-body { padding: 1rem; }
+    .role-badge { font-size: 0.7rem; padding: 0.15rem 0.5rem; border-radius: 3px;
+                  border: 1px solid var(--border); }
+    .render-block { background: #0d1117; border: 1px solid var(--border); border-radius: 4px;
+                    padding: 0.75rem; margin-top: 0.5rem; font-family: monospace; font-size: 0.8rem; }
+    .render-label { font-size: 0.7rem; color: var(--muted); margin-bottom: 0.25rem; }
+    .state-block { font-size: 0.75rem; color: var(--muted); white-space: pre; overflow-x: auto; }
+    .btn { border: none; padding: 0.4rem 1rem; border-radius: 4px; cursor: pointer;
+           font-size: 0.8rem; transition: opacity 0.2s; }
+    .btn-toggle { background: var(--accent); color: #0d1117; }
+    .btn-toggle:hover { opacity: 0.85; }
+    .section-title { font-size: 1rem; color: var(--muted); margin: 2rem 0 1rem;
+                     padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+    .source-card { background: var(--surface); border: 1px solid var(--border);
+                   border-radius: 6px; margin-bottom: 1rem; overflow: hidden; }
+    .source-header { padding: 0.5rem 1rem; background: #1c2128;
+                     font-size: 0.75rem; display: flex; justify-content: space-between;
+                     border-bottom: 1px solid var(--border); }
+    .source-body pre { padding: 1rem; font-size: 0.72rem; color: #8b949e; overflow-x: auto; }
+    .stats { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+            padding: 0.75rem 1.25rem; font-size: 0.8rem; }
+    .stat strong { display: block; font-size: 1.4rem; color: var(--accent); }
+    .dop-button { padding: 0.75rem 2rem; font-size: 1.1rem; font-weight: 700;
+                  border: none; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+    .dop-button.on  { background: var(--on); color: #0d1117; }
+    .dop-button.off { background: var(--off); color: #fff; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>? NSIGII DOP Adapter</h1>
+    <span class="badge">{{.PackageName}}</span>
+    <span class="badge">mode: {{.Mode}}</span>
+    <span class="badge">v{{.Version}}</span>
+    <span class="badge">{{.LoadedAt}}</span>
+  </div>
+
+  <div class="container">
+
+    <div class="stats">
+      <div class="stat"><strong>{{len .Components}}</strong> Components</div>
+      <div class="stat"><strong>{{len .Sources}}</strong> Source Files</div>
+      <div class="stat"><strong>{{.NumAssets}}</strong> Assets</div>
+      <div class="stat"><strong>{{.Mode}}</strong> Render Mode</div>
+    </div>
+
+    <div class="section-title">? Active DOP Components</div>
+    <div class="grid">
+      {{range .Components}}
+      <div class="card">
+        <div class="card-header">
+          <span>{{.Name}}</span>
+          <span class="role-badge">{{.Role}}</span>
+          <button class="btn btn-toggle"
+            onclick="toggle('{{.Name}}')" id="btn-{{.Name}}">Toggle</button>
+        </div>
+        <div class="card-body">
+          {{if .Functional}}
+          <div class="render-label">[Functional Render]</div>
+          <div class="render-block" id="func-{{.Name}}">{{.Functional}}</div>
+          {{end}}
+          {{if .OOP}}
+          <div class="render-label" style="margin-top:0.5rem">[OOP Render]</div>
+          <div class="render-block" id="oop-{{.Name}}">{{.OOP}}</div>
+          {{end}}
+          <div class="render-label" style="margin-top:0.75rem">State</div>
+          <div class="render-block state-block" id="state-{{.Name}}">{{.State}}</div>
+        </div>
+      </div>
+      {{end}}
+    </div>
+
+    <div class="section-title">?? Source Files (from zip)</div>
+    {{range .Sources}}
+    <div class="source-card">
+      <div class="source-header">
+        <span>{{.Path}}</span>
+        <span>{{.Role}} ๚ {{.Lines}} lines</span>
+      </div>
+      <div class="source-body"><pre>{{.Source}}</pre></div>
+    </div>
+    {{end}}
+
+  </div>
+
+  <script>
+    async function toggle(name) {
+      const res  = await fetch('/toggle?component=' + encodeURIComponent(name), { method: 'POST' });
+      const data = await res.json();
+      const rendered = data.rendered || '';
+      const el = document.getElementById('oop-' + name) ||
+                 document.getElementById('func-' + name);
+      if (el) el.innerHTML = rendered;
+      const stateEl = document.getElementById('state-' + name);
+      if (stateEl) stateEl.textContent = JSON.stringify(data.state, null, 2);
+      // update button visual if it's a dop-button
+      const btn = el ? el.querySelector('button') : null;
+      if (btn) {
+        btn.className = 'dop-button ' + (data.state.clicked ? 'on' : 'off');
+        btn.textContent = data.state.clicked ? 'ON' : 'OFF';
+      }
+    }
+  </script>
+</body>
+</html>`))
