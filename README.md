@@ -6,7 +6,25 @@
 **Protocol**: Human Rights Verification System
 
 ## Overview
-
+```psc
+1. parse input/output args
+2. detect whether input comes from stdin pipe or flag
+3. detect video size with ffprobe if needed
+4. use ffmpeg to decode video into RGB24 frames
+5. create .nsigii output file and write custom header
+6. for each frame:
+   6.1 split frame into halves
+   6.2 reunite halves
+   6.3 transmitter encodes bytes with RiftEncode
+   6.4 receiver checks simple hash and updates state
+   6.5 verifier computes discriminant-based consensus
+   6.6 if chaos, apply repair transform
+   6.7 convert RGB to YUV420
+   6.8 compress with DEFLATE
+   6.9 write frame size + frame bytes
+7. patch final frame count into header
+8. print encoding statistics
+```
 The NSIGII codec implements a trident channel architecture for video encoding that provides mathematical verification of data integrity through discriminant-based flash sequences and bipolar enzyme operations. The system integrates ROPEN sparse duplex encoding with Red-Black AVL tree pruning to achieve compression ratios exceeding 90% while maintaining cryptographic verification at each processing stage.
 
 ## Quick Start
